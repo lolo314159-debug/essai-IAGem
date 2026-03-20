@@ -1,12 +1,14 @@
 import streamlit as st
-import google.generativeai as genai
 import yfinance as yf
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from scipy import stats
+import google.generativeai as genai
 
-# 1. Configuration de la page
-st.set_page_config(page_title="IA Financial Analyst Pro", page_icon="⚖️", layout="wide")
+# --- Configuration ---
+st.set_page_config(page_title="Quant Analysis & IA", layout="wide")
 
-# 2. Gestion de la Clé API (Secrets ou Sidebar)
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
@@ -15,84 +17,111 @@ else:
 if api_key:
     genai.configure(api_key=api_key)
 
-# 3. Récupération des données (Optimisée avec Cache)
+# --- Fonctions de Calcul ---
 @st.cache_data(ttl=3600)
-def get_full_analysis_data(ticker_symbol):
+def get_extended_data(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
-    info = stock.info
     
-    # Ratios et Valeurs Clés
-    data = {
-        "name": info.get("longName", "N/A"),
-        "price": info.get("currentPrice"),
-        "market_cap": info.get("marketCap"),
-        "per_actual": info.get("trailingPE"),
-        "per_forward": info.get("forwardPE"),
-        "yield_actual": (info.get("dividendYield", 0) or 0) * 100,
-        "yield_5y_avg": info.get("fiveYearAvgDividendYield", "N/A"),
-        "roe": (info.get("returnOnEquity", 0) or 0) * 100,
+    # 1. Historique long terme (depuis 2000)
+    df = stock.history(start="2000-01-01")
+    if df.empty: return None, None, None
+    
+    # 2. Ratios fondamentaux
+    info = stock.info
+    metrics = {
+        "name": info.get("longName"),
+        "per": info.get("trailingPE"),
+        "forward_per": info.get("forwardPE"),
+        "yield": (info.get("dividendYield") or 0) * 100,
+        "yield_5y": info.get("fiveYearAvgDividendYield") or "N/A",
         "debt_equity": info.get("debtToEquity"),
-        "marge_ope": (info.get("operatingMargins", 0) or 0) * 100,
-        "summary": info.get("longBusinessSummary", "")[:800]
+        "roe": (info.get("returnOnEquity") or 0) * 100,
+        "high_52": info.get("fiftyTwoWeekHigh"),
+        "low_52": info.get("fiftyTwoWeekLow"),
     }
-    return data
+    return df, metrics, info
 
-def format_bn(num):
-    if not num: return "N/A"
-    return f"{num/1e9:.2f} Md $" if num > 1e9 else f"{num/1e6:.2f} M $"
+def calculate_regression(df):
+    # Travail sur l'échelle Log
+    df = df.copy()
+    df['Log_Price'] = np.log(df['Close'])
+    df['Time_Index'] = np.arange(len(df))
+    
+    # Régression linéaire : Log(P) = m * Time + b
+    slope, intercept, r_value, p_value, std_err = stats.linregress(df['Time_Index'], df['Log_Price'])
+    
+    df['Regression'] = intercept + slope * df['Time_Index']
+    
+    # Calcul des Bandes (Sigma)
+    residuals = df['Log_Price'] - df['Regression']
+    std_dev = np.std(residuals)
+    
+    df['Upper_1s'] = df['Regression'] + std_dev
+    df['Lower_1s'] = df['Regression'] - std_dev
+    df['Upper_2s'] = df['Regression'] + 2 * std_dev
+    df['Lower_2s'] = df['Regression'] - 2 * std_dev
+    
+    # Repasser en échelle normale pour le graphique
+    for col in ['Regression', 'Upper_1s', 'Lower_1s', 'Upper_2s', 'Lower_2s']:
+        df[col] = np.exp(df[col])
+        
+    return df, std_dev, r_value**2
 
-# --- INTERFACE PRINCIPALE ---
-st.title("⚖️ Analyseur de Valeur Fondamentale")
-ticker = st.text_input("Symbole Boursier", "AAPL").upper()
+# --- Interface ---
+st.title("📈 Analyse Quantitative & IA Stratégique")
+ticker = st.text_input("Ticker", "AAPL").upper()
 
-if st.button("Lancer l'Analyse Complète"):
-    if not api_key:
-        st.error("Clé API manquante.")
-    else:
-        try:
-            # --- PHASE 1 : DONNÉES ---
-            with st.spinner("Extraction des données Yahoo Finance..."):
-                d = get_full_analysis_data(ticker)
+if st.button("Lancer l'Analyse"):
+    df, metrics, raw_info = get_extended_data(ticker)
+    
+    if df is not None:
+        # 1. Calculs Quants
+        df_reg, sigma, r_squared = calculate_regression(df)
+        current_price = df_reg['Close'].iloc[-1]
+        reg_price = df_reg['Regression'].iloc[-1]
+        dist_reg = ((current_price - reg_price) / reg_price) * 100
+        
+        # 2. Affichage des Ratios
+        st.subheader(f"📊 Ratios Fondamentaux - {metrics['name']}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Prix Actuel", f"{current_price:.2f} $")
+        c2.metric("PER (TTM)", f"{metrics['per']:.2f}" if metrics['per'] else "N/A")
+        c3.metric("Rendement", f"{metrics['yield']:.2f} %")
+        c4.metric("Position / Régression", f"{dist_reg:.1f} %")
+
+        # 3. Graphique Logarithmique
+        fig = go.Figure()
+        # Bandes 2-Sigma (Zone d'extrême)
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Upper_2s'], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Lower_2s'], fill='tonexty', fillcolor='rgba(255, 0, 0, 0.1)', name="Zone 2-Sigma", line=dict(width=0)))
+        
+        # Bandes 1-Sigma (Zone normale)
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Upper_1s'], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Lower_1s'], fill='tonexty', fillcolor='rgba(0, 255, 0, 0.1)', name="Zone 1-Sigma", line=dict(width=0)))
+
+        # Prix et Régression
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Close'], name="Prix", line=dict(color='white', width=1.5)))
+        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Regression'], name="Régression (Moyenne)", line=dict(color='yellow', dash='dash')))
+
+        fig.update_layout(yaxis_type="log", template="plotly_dark", height=600, title=f"Courbe de Croissance Logarithmique - R²: {r_squared:.2f}")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 4. Analyse IA
+        with st.spinner("Analyse contextuelle par Gemini..."):
+            model = genai.GenerativeModel('models/gemini-2.5-flash')
+            prompt = f"""
+            Analyse {ticker} avec ces données :
+            - Prix : {current_price:.2f}$ (vs 52w High: {metrics['high_52']}, Low: {metrics['low_52']})
+            - PER Actuel: {metrics['per']}, Forward: {metrics['forward_per']}
+            - Stats Régression : Le prix est à {dist_reg:.1f}% de sa droite de tendance historique (échelle log).
+            - Qualité : ROE {metrics['roe']:.2f}%, Dette/Equity {metrics['debt_equity']}.
             
-            st.header(f"Rapport : {d['name']} ({ticker})")
-            
-            # Affichage rapide en colonnes
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Prix", f"{d['price']} $")
-            c2.metric("Market Cap", format_bn(d['market_cap']))
-            c3.metric("PER Actuel", f"{d['per_actual']:.2f}" if d['per_actual'] else "N/A")
-            c4.metric("Rendement", f"{d['yield_actual']:.2f} %")
-
-            # --- PHASE 2 : ANALYSE IA ---
-            with st.spinner("Analyse stratégique par Gemini 2.5 Flash..."):
-                model = genai.GenerativeModel('models/gemini-2.5-flash')
-                
-                # Le prompt contient maintenant toutes les variables extraites
-                prompt = f"""
-                Agis en tant qu'analyste financier expert en "Value Investing".
-                Analyse l'action {d['name']} ({ticker}) avec les données suivantes :
-                - Valorisation : PER Actuel {d['per_actual']}, PER Futur {d['per_forward']}.
-                - Rendement : {d['yield_actual']}% (Moyenne 5 ans : {d['yield_5y_avg']}%).
-                - Rentabilité : ROE {d['roe']:.2f}%, Marge Opérationnelle {d['marge_ope']:.2f}%.
-                - Santé : Dette/Equity {d['debt_equity']}.
-                - Business : {d['summary']}
-
-                Instructions :
-                1. Compare le PER actuel au PER futur pour juger la croissance attendue.
-                2. Analyse si le rendement dividende actuel est une opportunité par rapport à l'historique (5y avg).
-                3. Évalue la solidité du bilan (Dette/Equity).
-                4. Donne un verdict final (Surévalué, Sous-évalué ou Juste Prix) et les points de vigilance.
-                Réponds en français de manière structurée.
-                """
-                
-                response = model.generate_content(prompt)
-                
-                st.subheader("🤖 Analyse Stratégique de l'IA")
-                st.markdown("---")
-                st.markdown(response.text)
-
-        except Exception as e:
-            st.error(f"Une erreur est survenue : {e}")
-
-st.divider()
-st.caption("Sources : Yahoo Finance API & Google Gemini 2.5 Flash.")
+            Instructions :
+            1. Dis si l'action est statistiquement chère (ex: au-dessus de +1 sigma) ou bon marché.
+            2. Identifie les supports techniques (Low 52w ou ligne de régression) et résistances.
+            3. Verdict final sur la valorisation.
+            Réponds en français de façon concise.
+            """
+            response = model.generate_content(prompt)
+            st.subheader("🤖 Verdict de l'IA")
+            st.markdown(response.text)
