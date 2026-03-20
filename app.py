@@ -1,53 +1,37 @@
 import streamlit as st
 import google.generativeai as genai
 
-# Configuration de la page
-st.set_page_config(page_title="IA Financial Analyst", page_icon="📈")
+st.title("🛠 Diagnostic Gemini")
 
-# --- Gestion de la Clé API ---
-# On cherche d'abord dans les secrets Streamlit, sinon on demande à l'utilisateur
+# Saisie de la clé
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
-    api_key = st.sidebar.text_input("Clé API Gemini non détectée. Entrez-la ici :", type="password")
+    api_key = st.sidebar.text_input("Clé API Gemini :", type="password")
 
 if api_key:
-    genai.configure(api_key=api_key)
+    try:
+        genai.configure(api_key=api_key)
+        
+        # Étape 1 : Lister les modèles disponibles pour TA clé
+        st.write("### Modèles accessibles avec votre clé :")
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        if available_models:
+            st.success(f"Connexion réussie ! Modèles trouvés : {available_models}")
+            
+            # Étape 2 : Test de génération avec le premier modèle de la liste
+            selected_model = st.selectbox("Choisissez un modèle pour tester :", available_models)
+            ticker = st.text_input("Ticker pour le test (ex: AAPL) :", "AAPL")
+            
+            if st.button("Tester la génération"):
+                model = genai.GenerativeModel(selected_model)
+                response = model.generate_content(f"Donne-moi une info courte sur {ticker}")
+                st.write(response.text)
+        else:
+            st.warning("La clé est valide mais aucun modèle n'est listé. Vérifiez vos permissions sur Google AI Studio.")
 
-# --- Interface Principale ---
-st.title("🚀 Analyse Financière par Gemini")
-st.info("Entrez un ticker boursier pour obtenir une analyse fondamentale générée par l'IA.")
-
-ticker = st.text_input("Symbole de l'action (ex: AAPL, TSLA, MSFT) :", "").upper()
-
-if st.button("Lancer l'Analyse"):
-    if not api_key:
-        st.error("Veuillez configurer votre clé API Gemini.")
-    elif not ticker:
-        st.warning("Veuillez entrer un symbole boursier.")
-    else:
-        with st.spinner(f"Analyse de {ticker} en cours..."):
-            try:
-                model = genai.GenerativeModel('gemini-pro')
-                
-                prompt = f"""
-                Analyse l'action {ticker} en tant qu'expert financier. 
-                Structure ta réponse ainsi :
-                - Présentation rapide.
-                - Analyse du business model et avantages concurrentiels.
-                - Risques potentiels.
-                - Sentiment général du marché actuel.
-                Réponds en français avec un ton professionnel.
-                """
-                
-                response = model.generate_content(prompt)
-                
-                st.subheader(f"Rapport d'analyse : {ticker}")
-                st.markdown("---")  # Correction ici : les guillemets ont été ajoutés
-                st.markdown(response.text)
-                
-            except Exception as e:
-                st.error(f"Erreur lors de la génération : {e}")
-
-st.markdown("---")
-st.caption("Données fournies par Google Gemini. Pas un conseil en investissement.")
+    except Exception as e:
+        st.error(f"Erreur de connexion : {e}")
+else:
+    st.info("Veuillez entrer votre clé API pour tester.")
