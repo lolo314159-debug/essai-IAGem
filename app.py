@@ -28,7 +28,7 @@ if st.button("Lancer l'Analyse"):
     else:
         with st.spinner(f"Analyse de {ticker} en cours..."):
             try:
-                model = genai.GenerativeModel('gemini-1.5-flash')
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
                 
                 prompt = f"""
                 Analyse l'action {ticker} en tant qu'expert financier. 
