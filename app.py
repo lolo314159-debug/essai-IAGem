@@ -5,11 +5,11 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy import stats
 import google.generativeai as genai
+from datetime import datetime
 
-# --- Configuration de la Page ---
-st.set_page_config(page_title="Terminal Quant & IA", layout="wide")
+# --- Configuration ---
+st.set_page_config(page_title="Terminal Quant Expert", layout="wide")
 
-# Gestion de la Clé API
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 else:
@@ -18,157 +18,109 @@ else:
 if api_key:
     genai.configure(api_key=api_key)
 
-# --- Fonctions de Récupération & Calculs ---
 @st.cache_data(ttl=3600)
-def fetch_all_data(ticker_symbol):
-    stock = yf.Ticker(ticker_symbol)
+def get_stock_full_package(ticker):
+    stock = yf.Ticker(ticker)
+    df = stock.history(start="2000-01-01")
     info = stock.info
-    hist = stock.history(start="2000-01-01")
-    
-    if hist.empty:
-        return None, None
-    
-    # Compilation exhaustive des métriques
-    metrics = {
-        "Nom": info.get("longName", "N/A"),
-        "Secteur": info.get("sector", "N/A"),
-        "Prix Actuel": info.get("currentPrice"),
-        "Market Cap": info.get("marketCap"),
-        "Revenue TTM": info.get("totalRevenue"),
-        "Net Income TTM": info.get("netIncomeToCommon"),
-        "PER Trailing": info.get("trailingPE"),
-        "PER Forward": info.get("forwardPE"),
-        "P/S Ratio": info.get("priceToSalesTrailing12Months"),
-        "Yield (%)": (info.get("dividendYield") or 0) * 100,
-        "Yield 5Y Avg": info.get("fiveYearAvgDividendYield"),
-        "ROE (%)": (info.get("returnOnEquity") or 0) * 100,
-        "Operating Margin (%)": (info.get("operatingMargins") or 0) * 100,
-        "Debt/Equity": info.get("debtToEquity"),
-        "Payout Ratio (%)": (info.get("payoutRatio") or 0) * 100,
-        "52W High": info.get("fiftyTwoWeekHigh"),
-        "52W Low": info.get("fiftyTwoWeekLow"),
-        "Summary": info.get("longBusinessSummary", "")[:1000]
-    }
-    return hist, metrics
+    return df, info
 
-def calculate_log_regression(df):
-    df = df.copy()
-    df['Log_Price'] = np.log(df['Close'])
-    df['Days'] = np.arange(len(df))
+def calculate_quant_metrics(df_full, start_date, end_date):
+    # Filtrage pour le calcul de la régression uniquement
+    mask = (df_full.index.date >= start_date) & (df_full.index.date <= end_date)
+    df_calc = df_full.loc[mask].copy()
     
-    slope, intercept, r_value, p_value, std_err = stats.linregress(df['Days'], df['Log_Price'])
+    if len(df_calc) < 10: return None
     
-    df['Reg_Log'] = intercept + slope * df['Days']
-    residuals = df['Log_Price'] - df['Reg_Log']
+    # Régression Log
+    df_calc['Log_P'] = np.log(df_calc['Close'])
+    df_calc['Index'] = np.arange(len(df_calc))
+    slope, intercept, r_val, p_val, std_err = stats.linregress(df_calc['Index'], df_calc['Log_P'])
+    
+    # Calcul sur TOUT le dataframe pour affichage continu
+    df_full = df_full.copy()
+    # On recalcule l'index temporel basé sur le point de départ de la sélection
+    base_idx = df_full.index.get_loc(df_calc.index[0])
+    df_full['Global_Index'] = np.arange(len(df_full)) - base_idx
+    
+    df_full['Reg_Log'] = intercept + slope * df_full['Global_Index']
+    residuals = df_calc['Log_P'] - (intercept + slope * np.arange(len(df_calc)))
     std_dev = np.std(residuals)
     
-    # Calcul des courbes en échelle réelle
-    df['Reg_Price'] = np.exp(df['Reg_Log'])
-    df['Upper_1s'] = np.exp(df['Reg_Log'] + std_dev)
-    df['Lower_1s'] = np.exp(df['Reg_Log'] - std_dev)
-    df['Upper_2s'] = np.exp(df['Reg_Log'] + 2 * std_dev)
-    df['Lower_2s'] = np.exp(df['Reg_Log'] - 2 * std_dev)
+    # Transformation inverse (Exp)
+    df_full['Reg_P'] = np.exp(df_full['Reg_Log'])
+    df_full['U1'] = np.exp(df_full['Reg_Log'] + std_dev)
+    df_full['L1'] = np.exp(df_full['Reg_Log'] - std_dev)
+    df_full['U2'] = np.exp(df_full['Reg_Log'] + 2 * std_dev)
+    df_full['L2'] = np.exp(df_full['Reg_Log'] - 2 * std_dev)
     
-    return df, std_dev, r_value**2
+    return df_full, r_val**2, std_dev
 
-def format_val(val):
-    if val is None or val == "N/A": return "N/A"
-    if val >= 1e12: return f"{val/1e12:.2f} T$"
-    if val >= 1e9: return f"{val/1e9:.2f} Md$"
-    return f"{val:,.0f}$"
+# --- UI ---
+st.title("📈 Analyseur Quantitatif de Précision")
 
-# --- Interface Utilisateur ---
-st.title("🚀 Terminal d'Analyse Fondamentale & Quantitative")
-ticker = st.text_input("Entrez le Ticker (ex: NVDA, MC.PA, MSFT)", "AAPL").upper()
+col_input, col_dates = st.columns([1, 2])
+with col_input:
+    ticker = st.text_input("Ticker", "AAPL").upper()
+with col_dates:
+    # Curseur de date pour la régression
+    start_date_reg = st.slider("Période de calcul de la régression", 
+                              min_value=datetime(2000, 1, 1).date(), 
+                              max_value=datetime.now().date(),
+                              value=(datetime(2015, 1, 1).date(), datetime.now().date()))
 
-if st.button("Lancer l'Analyse"):
-    with st.spinner("Récupération des données..."):
-        hist, m = fetch_all_data(ticker)
+if st.button("Analyser"):
+    df, info = get_stock_full_package(ticker)
+    
+    if not df.empty:
+        # Calculs
+        df_res, r2, sigma_val = calculate_quant_metrics(df, start_date_reg[0], start_date_reg[1])
         
-    if hist is not None:
-        df_reg, sigma, r2 = calculate_log_regression(hist)
-        current_p = m["Prix Actuel"]
-        reg_p = df_reg['Reg_Price'].iloc[-1]
-        dist_reg = ((current_p - reg_p) / reg_p) * 100
+        # --- 1. AFFICHAGE DES RATIOS ---
+        st.subheader(f"📊 Données Fondamentales - {info.get('longName')}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Prix", f"{df['Close'].iloc[-1]:.2f} $")
+        m2.metric("PER (TTM)", f"{info.get('trailingPE'):.2f}" if info.get('trailingPE') else "N/A")
+        m3.metric("ROE", f"{info.get('returnOnEquity', 0)*100:.1f}%")
+        m4.metric("Dette/Equity", f"{info.get('debtToEquity'):.2f}" if info.get('debtToEquity') else "N/A")
 
-        # --- 1. ENTETE & METRIQUES ABSOLUES ---
-        st.header(f"{m['Nom']} | {m['Secteur']}")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Prix Actuel", f"{current_p:.2f} $")
-        c2.metric("Market Cap", format_val(m["Market Cap"]))
-        c3.metric("Chiffre d'Affaires", format_val(m["Revenue TTM"]))
-        c4.metric("Résultat Net", format_val(m["Net Income TTM"]))
-
-        # --- 2. RATIOS & PERFORMANCE ---
-        st.subheader("📊 Ratios de Valorisation & Rentabilité")
-        colA, colB, colC = st.columns(3)
-        with colA:
-            st.write("**Valorisation**")
-            st.write(f"• PER Actuel : `{m['PER Trailing']:.2f}`" if m['PER Trailing'] else "• PER Actuel : N/A")
-            st.write(f"• PER Futur : `{m['PER Forward']:.2f}`" if m['PER Forward'] else "• PER Futur : N/A")
-            st.write(f"• Price / Sales : `{m['P/S Ratio']:.2f}`")
-        with colB:
-            st.write("**Dividende & Rendement**")
-            st.write(f"• Rendement Actuel : `{m['Yield (%)']:.2f}%`")
-            st.write(f"• Moyenne 5 Ans : `{m['Yield 5Y Avg']}%`" if m['Yield 5Y Avg'] else "• Moyenne 5 Ans : N/A")
-            st.write(f"• Payout Ratio : `{m['Payout Ratio (%)']:.1f}%`")
-        with colC:
-            st.write("**Efficacité & Dette**")
-            st.write(f"• ROE : `{m['ROE (%)']:.2f}%`")
-            st.write(f"• Marge Opé. : `{m['Operating Margin (%)']:.2f}%`")
-            st.write(f"• Dette / Equity : `{m['Debt/Equity']:.2f}`")
-
-        # --- 3. GRAPHIQUE QUANTITATIF ---
-        st.subheader("📉 Croissance Logarithmique & Bandes de Régression")
-        
+        # --- 2. GRAPHIQUE ---
         fig = go.Figure()
-        # Bandes 2-Sigma (Extrêmes)
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Upper_2s'], line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Lower_2s'], fill='tonexty', fillcolor='rgba(255, 0, 0, 0.1)', name="Zone Sous-évaluée (2σ)"))
-        # Bandes 1-Sigma
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Upper_1s'], line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Lower_1s'], fill='tonexty', fillcolor='rgba(0, 255, 0, 0.1)', name="Zone Normale (1σ)"))
-        # Prix & Régression
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Close'], name="Prix Historique", line=dict(color='white', width=1)))
-        fig.add_trace(go.Scatter(x=df_reg.index, y=df_reg['Reg_Price'], name="Ligne de Régression", line=dict(color='yellow', dash='dash')))
+        
+        # Bandes Sigma (très transparentes)
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['U2'], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['L2'], fill='tonexty', fillcolor='rgba(255, 0, 0, 0.05)', name="Extrême (2σ)"))
+        
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['U1'], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['L1'], fill='tonexty', fillcolor='rgba(0, 255, 0, 0.05)', name="Normal (1σ)"))
+
+        # Prix (Blanc vif et épais)
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Close'], name="Prix", line=dict(color='white', width=2.5)))
+        
+        # Régression (Jaune pointillé)
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Reg_P'], name="Tendance", line=dict(color='yellow', dash='dot', width=1.5)))
 
         fig.update_layout(yaxis_type="log", template="plotly_dark", height=600, 
-                          title=f"R² de la tendance : {r2:.2f} | Distance à la moyenne : {dist_reg:.1f}%")
+                          title=f"Régression calculée du {start_date_reg[0]} au {start_date_reg[1]} (R²: {r2:.2f})")
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- 4. ANALYSE IA GEMINI ---
+        # --- 3. ANALYSE IA ---
         if api_key:
-            with st.spinner("L'IA synthétise les données..."):
+            with st.spinner("Analyse Gemini en cours..."):
+                current_p = df['Close'].iloc[-1]
+                target_p = df_res['Reg_P'].iloc[-1]
+                dist = ((current_p - target_p) / target_p) * 100
+                
                 model = genai.GenerativeModel('models/gemini-2.5-flash')
-                
-                # Prompt ultra-complet incluant toutes les informations extraites
                 prompt = f"""
-                Analyse {m['Nom']} ({ticker}).
-                DONNÉES FINANCIÈRES :
-                - PER: {m['PER Trailing']} (Actuel) vs {m['PER Forward']} (Futur).
-                - Marges: ROE {m['ROE (%)']:.2f}%, Marge Opé {m['Operating Margin (%)']:.2f}%.
-                - Dividende: {m['Yield (%)']:.2f}% (Moyenne 5 ans: {m['Yield 5Y Avg']}%).
-                - Dette/Equity: {m['Debt/Equity']}.
+                Analyse {ticker} avec :
+                - PER: {info.get('trailingPE')}, Forward PER: {info.get('forwardPE')}
+                - Rentabilité: ROE {info.get('returnOnEquity', 0)*100:.2f}%, Marge {info.get('operatingMargins', 0)*100:.2f}%
+                - Dette/Equity: {info.get('debtToEquity')}
+                - Quanti: Le prix est à {dist:.1f}% de sa droite de régression log calculée sur la période {start_date_reg}.
                 
-                DONNÉES QUANTI :
-                - Position vs Régression Log: {dist_reg:.1f}%.
-                - Support (Plus bas 52 sem): {m['52W Low']}$.
-                - Résistance (Plus haut 52 sem): {m['52W High']}$.
-                
-                CONTEXTE : {m['Summary']}
-
-                MISSIONS :
-                1. Analyse la valorisation en croisant PER et distance à la régression.
-                2. Juger la rentabilité (ROE/Marges) et la sécurité (Dette).
-                3. Comparer le rendement actuel à sa moyenne historique.
-                4. Verdict final : "Sous-évalué", "Juste Prix" ou "Surévalué". 
-                Réponds en français, avec un ton pro et structuré.
+                Donne un verdict sur la valorisation (sous/sur-évalué) et identifie les supports/résistances visibles sur le graphique.
                 """
-                
                 response = model.generate_content(prompt)
-                st.subheader("🤖 Diagnostic de l'IA Gemini")
+                st.subheader("🤖 Analyse Stratégique")
                 st.markdown(response.text)
-    else:
-        st.error("Impossible de récupérer les données pour ce ticker.")
-
-st.caption("Données Yahoo Finance & Analyse Quantitative Scalée. Gemini 2.5 Flash API.")
