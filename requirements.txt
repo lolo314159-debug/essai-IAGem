@@ -2,3 +2,5 @@ streamlit
 yfinance
 google-generativeai>=0.5.0
 pandas
+numpy
+plotly
